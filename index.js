@@ -1,8 +1,9 @@
 import { GetObjectCommand, PutObjectCommand, DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, mkdir } from "node:fs";
 import axios from "axios";
+import { finished } from "stream";
 
 const RESOLUTIONS = [
     { name: "360p", width: 480, height: 360 },
@@ -23,10 +24,9 @@ const BUCKET = process.env.BUCKET_NAME;
 const KEY = process.env.KEY;
 const VIDEO_STATUS_API = process.env.VIDEO_STATUS_API;
 
-
-async function notifyStatus(status , videoId) {
+async function notifyStatus(status, videoId) {
     try {
-        await axios.patch(VIDEO_STATUS_API, { videoId : videoId , status : status });
+        await axios.patch(VIDEO_STATUS_API, { videoId: videoId, status: status });
     } catch (error) {
         console.error("Error notifying status:", error);
     }
@@ -39,8 +39,13 @@ async function downloadVideo(bucket, key, filePath) {
     result.Body.pipe(writableStream);
 
     return new Promise((resolve, reject) => {
-        writableStream.on('finish', resolve);
-        writableStream.on('error', reject);
+        finished(writableStream, (err) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve();
+            }
+        });
     });
 }
 
@@ -64,16 +69,24 @@ async function uploadVideo(bucket, key, filePath) {
     await s3Client.send(putCommand);
 }
 
-async function transcodeVideo(inputPath, outputPath, width, height) {
+async function transcodeVideo(inputPath, outputDir, width, height) {
     return new Promise((resolve, reject) => {
+        const outputFileName = `${outputDir}/index.m3u8`; // HLS playlist file
+
         ffmpeg(inputPath)
-            .output(outputPath)
-            .videoCodec("libx264")
-            .audioCodec("aac")
-            .size(`${width}x${height}`)
-            .on('end', resolve)
+            .outputOptions([
+                '-vf', `scale=${width}:${height}`,      // Video scaling
+                '-c:v', 'libx264',                     // Video codec
+                '-c:a', 'aac',                         // Audio codec
+                '-ar', '48000',                        // Audio sampling rate
+                '-b:a', '128k',                        // Audio bitrate
+                '-hls_time', '10',                     // Segment duration in seconds
+                '-hls_playlist_type', 'vod',           // Playlist type
+                '-hls_segment_filename', `${outputDir}/segment_%03d.ts` // Segment file pattern
+            ])
+            .output(outputFileName)
+            .on('end', () => resolve(outputFileName))
             .on('error', reject)
-            .format("mp4")
             .run();
     });
 }
@@ -85,20 +98,30 @@ async function processVideo() {
 
     try {
         console.log("Transcoding started");
-        await notifyStatus("transcoding" , videoPath[3]);
+        await notifyStatus("transcoding", videoPath[3]);
         await downloadVideo(BUCKET, KEY, originalFilePath);
         await deleteVideo(BUCKET, KEY);
 
         for (const resolution of RESOLUTIONS) {
-            const outputFilePath = `${resolution.name}.mp4`;
-            const outputKey = `${basePath}/${resolution.name}.mp4`;
+            const outputDir = `${resolution.name}`; // Directory for this resolution's output
+            const outputKey = `${basePath}/${resolution.name}`; // S3 key prefix for this resolution
 
-            await transcodeVideo(originalFilePath, outputFilePath, resolution.width, resolution.height);
-            await uploadVideo(BUCKET, outputKey, outputFilePath);
-            await fs.unlink(outputFilePath);
+            await fs.mkdir(outputDir); // Create directory for output
+
+            const outputFilePath = await transcodeVideo(originalFilePath, outputDir, resolution.width, resolution.height);
+
+            // Upload each segment and the m3u8 file
+            const files = await fs.readdir(outputDir);
+            await Promise.all(files.map(async (file) => {
+                const filePath = `${outputDir}/${file}`;
+                await uploadVideo(BUCKET, `${outputKey}/${file}`, filePath);
+                await fs.unlink(filePath); // Clean up local files
+            }));
+
+            await fs.rmdir(outputDir); // Remove directory after upload
         }
 
-        await notifyStatus("completed" , videoPath[3]);
+        await notifyStatus("completed", videoPath[3]);
     } catch (error) {
         console.error("Error during processing:", error);
         try {
