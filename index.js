@@ -1,7 +1,7 @@
 import { GetObjectCommand, PutObjectCommand, DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "node:fs/promises";
-import { createWriteStream, mkdir } from "node:fs";
+import { createWriteStream } from "node:fs";
 import axios from "axios";
 import { finished } from "stream";
 
@@ -23,6 +23,11 @@ const s3Client = new S3Client({
 const BUCKET = process.env.BUCKET_NAME;
 const KEY = process.env.KEY;
 const VIDEO_STATUS_API = process.env.VIDEO_STATUS_API;
+
+console.log("Processing video:", KEY);
+console.log("Resolutions:", RESOLUTIONS);
+console.log("Bucket:", BUCKET);
+console.log("Video status API:", VIDEO_STATUS_API);
 
 async function notifyStatus(status, videoId) {
     try {
@@ -100,7 +105,7 @@ async function processVideo() {
         console.log("Transcoding started");
         await notifyStatus("transcoding", videoPath[3]);
         await downloadVideo(BUCKET, KEY, originalFilePath);
-        await deleteVideo(BUCKET, KEY);
+
 
         for (const resolution of RESOLUTIONS) {
             const outputDir = `${resolution.name}`; // Directory for this resolution's output
@@ -108,7 +113,7 @@ async function processVideo() {
 
             await fs.mkdir(outputDir); // Create directory for output
 
-            const outputFilePath = await transcodeVideo(originalFilePath, outputDir, resolution.width, resolution.height);
+            await transcodeVideo(originalFilePath, outputDir, resolution.width, resolution.height);
 
             // Upload each segment and the m3u8 file
             const files = await fs.readdir(outputDir);
@@ -121,11 +126,13 @@ async function processVideo() {
             await fs.rmdir(outputDir); // Remove directory after upload
         }
 
+        await deleteVideo(BUCKET, KEY);
         await notifyStatus("completed", videoPath[3]);
     } catch (error) {
         console.error("Error during processing:", error);
         try {
             await uploadVideo(BUCKET, KEY, originalFilePath);
+            await deleteVideo(BUCKET, KEY);
         } catch (uploadError) {
             console.error("Error uploading original video back to S3:", uploadError);
         }
